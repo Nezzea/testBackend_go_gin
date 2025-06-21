@@ -17,11 +17,15 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+type userData struct {
+	ID    string `bson:"_id,omitempty" json:"id"`
+	Name  string `bson:"name" json:"name"`
+	Email string `bson:"email" json:"email"`
+}
+
 type userPrivateData struct {
-	ID           string    `bson:"_id,omitempty" json:"id"`
+	userData
 	Username     string    `bson:"username" json:"username"`
-	Name         string    `bson:"name" json:"name"`
-	Email        string    `bson:"email" json:"email"`
 	Password     string    `bson:"password" json:"password"`
 	Age          int       `bson:"age" json:"age"`
 	Deleted      bool      `bson:"deleted" json:"deleted"`
@@ -29,17 +33,13 @@ type userPrivateData struct {
 	TokenVersion int       `bson:"tokenVersion" json:"tokenVersion"`
 }
 
-type userData struct {
-	ID      string `bson:"_id,omitempty" json:"id"`
-	Name    string `bson:"name" json:"name"`
-	Email   string `bson:"email" json:"email"`
-	Deleted bool   `bson:"deleted" json:"deleted"`
-}
-
 type RequestData struct {
-	Username     string `bson:"username" json:"username"`
-	Password     string `bson:"password" json:"password"`
-	TokenVersion int    `bson:"tokenVersion" json:"tokenVersion"`
+	ID           string    `bson:"_id,omitempty" json:"id"`
+	Username     string    `bson:"username" json:"username"`
+	Password     string    `bson:"password" json:"password"`
+	Deleted      bool      `bson:"deleted" json:"deleted"`
+	DeletedAt    time.Time `bson:"deletedAt,omitempty" json:"deletedAt,omitempty"`
+	TokenVersion int       `bson:"tokenVersion" json:"tokenVersion"`
 }
 
 type BlacklistedToken struct {
@@ -61,6 +61,7 @@ var mongoClient *mongo.Client
 // สร้าง JWT token
 func generateToken(user RequestData, jwtSecret []byte) (string, error) {
 	claims := jwt.MapClaims{
+		"_id":          user.ID,
 		"username":     user.Username,
 		"tokenVersion": user.TokenVersion,
 		"exp":          time.Now().Add(time.Hour * 24).Unix(), // หมดอายุ 24 ชม.
@@ -70,10 +71,24 @@ func generateToken(user RequestData, jwtSecret []byte) (string, error) {
 	return token.SignedString(jwtSecret)
 }
 
+func addBlacklist(authHeader string, claims jwt.MapClaims) error {
+	expUnix := int64(claims["exp"].(float64))
+	expTime := time.Unix(expUnix, 0)
+
+	collection := mongoClient.Database("testBackend").Collection("blacklist_tokens")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := collection.InsertOne(ctx, BlacklistedToken{
+		Token:     authHeader,
+		ExpiresAt: expTime,
+	})
+	return err
+}
+
 // ฟังชั่นเพื่อแปลง JWT
 func parseJWT(c *gin.Context, jwtSecret []byte) (jwt.MapClaims, bool) {
 	var blacklistedToken BlacklistedToken
-
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
@@ -121,8 +136,6 @@ func authMiddleware(jwtSecret []byte) gin.HandlerFunc {
 		var user userPrivateData
 
 		if !ok || claims["username"] == nil || claims["tokenVersion"] == nil {
-			fmt.Println("claims['username']: ", claims["username"])
-			fmt.Println("claims['tokenVersion']: ", claims["tokenVersion"])
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
 			c.Abort()
 			return
@@ -140,12 +153,14 @@ func authMiddleware(jwtSecret []byte) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+
 		if user.TokenVersion != tokenVersion {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token has been invalidated"})
 			c.Abort()
 			return
 		}
 
+		c.Set("userID", claims["_id"])
 		c.Next()
 	}
 }
@@ -196,7 +211,7 @@ func main() {
 	// 2.4.1 Hard Delete
 	auth.DELETE("/user/hard/:id", hardDeleteUserByIDHandler)
 	// 2.4.1 Soft Delete
-	auth.DELETE("/user/soft/:id", softDeleteUserByIDHandler)
+	auth.PUT("/user/soft/:id", softDeleteUserByIDHandler)
 	// 3.1.1
 	r.POST("/requestResetPassword", requestResetPasswordHandler)
 	// 3.1.2
@@ -225,6 +240,11 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
+	if user.Deleted {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User Deleted(soft)"})
+		return
+	}
+
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginData.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
@@ -242,36 +262,17 @@ func loginHandler(c *gin.Context) {
 func logoutHanler(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
 		return
 	}
 
-	// parse เพื่อดู expiry ของ token
-	token, err := jwt.Parse(authHeader, func(token *jwt.Token) (interface{}, error) {
-		return jwtGeneralSecret, nil
-	})
-	if err != nil || !token.Valid {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token"})
-		return
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
+	claims, ok := parseJWT(c, jwtGeneralSecret)
 	if !ok || claims["exp"] == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token claims"})
 		return
 	}
 
-	expUnix := int64(claims["exp"].(float64))
-	expTime := time.Unix(expUnix, 0)
-
-	collection := mongoClient.Database("testBackend").Collection("blacklist_tokens")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err = collection.InsertOne(ctx, BlacklistedToken{
-		Token:     authHeader,
-		ExpiresAt: expTime,
-	})
+	err := addBlacklist(authHeader, claims)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to blacklist token"})
 		return
@@ -296,7 +297,7 @@ func registerHandler(c *gin.Context) {
 		return
 	}
 
-	soft_count, err := collection.CountDocuments(ctx, bson.M{
+	count, err := collection.CountDocuments(ctx, bson.M{
 		"username": newUser.Username,
 		"$or": []bson.M{
 			{"deleted": false},
@@ -306,12 +307,12 @@ func registerHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error checking username"})
 		return
 	}
-	if soft_count > 0 {
+	if count > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Username already exists"})
 		return
 	}
 
-	hard_count, err := collection.CountDocuments(ctx, bson.M{
+	soft_count, err := collection.CountDocuments(ctx, bson.M{
 		"username": newUser.Username,
 		"deleted":  true,
 	})
@@ -319,7 +320,7 @@ func registerHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error checking username"})
 		return
 	}
-	if hard_count > 0 {
+	if soft_count > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Username already exists(But soft Delete)"})
 		return
 	}
@@ -396,8 +397,19 @@ func getUserByIDHandler(c *gin.Context) {
 }
 
 func updateUserByIDHandler(c *gin.Context) {
-	id := c.Param("id")
 	var updateData userPrivateData
+	id := c.Param("id")
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
+		return
+	}
+
+	claims, ok := parseJWT(c, jwtGeneralSecret)
+	if !ok || claims["exp"] == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token claims"})
+		return
+	}
 
 	// แปลง string id เป็น ObjectID
 	objID, err := primitive.ObjectIDFromHex(id)
@@ -408,6 +420,18 @@ func updateUserByIDHandler(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&updateData); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// แก้ไขได้เฉพราะตัวเอง
+	if userID != id {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can update only your own account"})
 		return
 	}
 
@@ -433,6 +457,11 @@ func updateUserByIDHandler(c *gin.Context) {
 			return
 		}
 		updateFields["password"] = string(hashedPassword)
+		err = addBlacklist(authHeader, claims)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to blacklist token"})
+			return
+		}
 	}
 
 	if len(updateFields) == 0 {
@@ -459,11 +488,34 @@ func updateUserByIDHandler(c *gin.Context) {
 
 func hardDeleteUserByIDHandler(c *gin.Context) {
 	id := c.Param("id")
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
+		return
+	}
+
+	claims, ok := parseJWT(c, jwtGeneralSecret)
+	if !ok || claims["exp"] == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token claims"})
+		return
+	}
 
 	// แปลง id เป็น ObjectID
 	objID, err := primitive.ObjectIDFromHex(id)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ID format"})
+		return
+	}
+
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// ลบได้เฉพราะตัวเอง
+	if userID != id {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can delete only your own account"})
 		return
 	}
 
@@ -482,16 +534,45 @@ func hardDeleteUserByIDHandler(c *gin.Context) {
 		return
 	}
 
+	err = addBlacklist(authHeader, claims)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to blacklist token"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 }
 
 func softDeleteUserByIDHandler(c *gin.Context) {
 	id := c.Param("id")
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
+		return
+	}
+
+	claims, ok := parseJWT(c, jwtGeneralSecret)
+	if !ok || claims["exp"] == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token claims"})
+		return
+	}
 
 	// แปลง id เป็น ObjectID
 	objID, err := primitive.ObjectIDFromHex(id)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ID format"})
+		return
+	}
+
+	userID, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// ลบได้เฉพราะตัวเอง
+	if userID != id {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You can delete only your own account"})
 		return
 	}
 
@@ -514,6 +595,12 @@ func softDeleteUserByIDHandler(c *gin.Context) {
 	}
 	if result.MatchedCount == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	err = addBlacklist(authHeader, claims)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to blacklist token"})
 		return
 	}
 
